@@ -58,7 +58,7 @@ class DictDiffer(object):
                    if self.past_dict[o] == self.current_dict[o])
 
 
-class auditlog_rule(models.Model):
+class AuditlogRule(models.Model):
     _name = 'auditlog.rule'
     _description = "Auditlog - Rule"
 
@@ -110,7 +110,7 @@ class auditlog_rule(models.Model):
 
     def _register_hook(self, cr, ids=None):
         """Get all rules and apply them to log method calls."""
-        super(auditlog_rule, self)._register_hook(cr)
+        super(AuditlogRule, self)._register_hook(cr)
         if not hasattr(self.pool, '_auditlog_field_cache'):
             self.pool._auditlog_field_cache = {}
         if not hasattr(self.pool, '_auditlog_model_cache'):
@@ -170,7 +170,8 @@ class auditlog_rule(models.Model):
         for rule in self:
             model_model = self.env[rule.model_id.model]
             for method in ['create', 'read', 'write', 'unlink']:
-                if getattr(rule, 'log_%s' % method):
+                if getattr(rule, 'log_%s' % method) and hasattr(
+                        getattr(model_model, method), 'origin'):
                     model_model._revert_method(method)
                     updated = True
         if updated:
@@ -181,7 +182,7 @@ class auditlog_rule(models.Model):
     # errors occurs with the `_register_hook()` BaseModel method.
     def create(self, cr, uid, vals, context=None):
         """Update the registry when a new rule is created."""
-        res_id = super(auditlog_rule, self).create(
+        res_id = super(AuditlogRule, self).create(
             cr, uid, vals, context=context)
         if self._register_hook(cr, [res_id]):
             modules.registry.RegistryManager.signal_registry_change(cr.dbname)
@@ -193,7 +194,7 @@ class auditlog_rule(models.Model):
         """Update the registry when existing rules are updated."""
         if isinstance(ids, (int, long)):
             ids = [ids]
-        super(auditlog_rule, self).write(cr, uid, ids, vals, context=context)
+        super(AuditlogRule, self).write(cr, uid, ids, vals, context=context)
         if self._register_hook(cr, ids):
             modules.registry.RegistryManager.signal_registry_change(cr.dbname)
         return True
@@ -202,18 +203,19 @@ class auditlog_rule(models.Model):
     def unlink(self):
         """Unsubscribe rules before removing them."""
         self.unsubscribe()
-        return super(auditlog_rule, self).unlink()
+        return super(AuditlogRule, self).unlink()
 
     def _make_create(self):
         """Instanciate a create method that log its calls."""
         @api.model
+        @api.returns('self', lambda value: value.id)
         def create(self, vals, **kwargs):
             self = self.with_context(auditlog_disabled=True)
             rule_model = self.env['auditlog.rule']
             new_record = create.origin(self, vals, **kwargs)
             new_values = dict(
-                (d['id'], d) for d in new_record.sudo().read(
-                    list(self._fields)))
+                (d['id'], d) for d in new_record.sudo()
+                .with_context(prefetch_fields=False).read(list(self._fields)))
             rule_model.sudo().create_logs(
                 self.env.uid, self._name, new_record.ids,
                 'create', None, new_values)
@@ -270,10 +272,12 @@ class auditlog_rule(models.Model):
             self = self.with_context(auditlog_disabled=True)
             rule_model = self.env['auditlog.rule']
             old_values = dict(
-                (d['id'], d) for d in self.sudo().read(list(self._fields)))
+                (d['id'], d) for d in self.sudo()
+                .with_context(prefetch_fields=False).read(list(self._fields)))
             result = write.origin(self, vals, **kwargs)
             new_values = dict(
-                (d['id'], d) for d in self.sudo().read(list(self._fields)))
+                (d['id'], d) for d in self.sudo()
+                .with_context(prefetch_fields=False).read(list(self._fields)))
             rule_model.sudo().create_logs(
                 self.env.uid, self._name, self.ids,
                 'write', old_values, new_values)
@@ -287,7 +291,8 @@ class auditlog_rule(models.Model):
             self = self.with_context(auditlog_disabled=True)
             rule_model = self.env['auditlog.rule']
             old_values = dict(
-                (d['id'], d) for d in self.sudo().read(list(self._fields)))
+                (d['id'], d) for d in self.sudo()
+                .with_context(prefetch_fields=False).read(list(self._fields)))
             rule_model.sudo().create_logs(
                 self.env.uid, self._name, self.ids, 'unlink', old_values)
             return unlink.origin(self, **kwargs)
@@ -304,6 +309,8 @@ class auditlog_rule(models.Model):
         if new_values is None:
             new_values = EMPTY_DICT
         log_model = self.env['auditlog.log']
+        http_request_model = self.env['auditlog.http.request']
+        http_session_model = self.env['auditlog.http.session']
         for res_id in res_ids:
             model_model = self.env[res_model]
             name = model_model.browse(res_id).name_get()
@@ -314,6 +321,8 @@ class auditlog_rule(models.Model):
                 'res_id': res_id,
                 'method': method,
                 'user_id': uid,
+                'http_request_id': http_request_model.current_http_request(),
+                'http_session_id': http_session_model.current_http_session(),
             }
             vals.update(additional_log_values or {})
             log = log_model.create(vals)
@@ -358,6 +367,7 @@ class auditlog_rule(models.Model):
             if field_name in FIELDS_BLACKLIST:
                 continue
             field = self._get_field(log.model_id, field_name)
+            # not all fields have an ir.models.field entry (ie. related fields)
             if field:
                 log_vals = self._prepare_log_line_vals_on_read(
                     log, field, read_values)
@@ -389,9 +399,11 @@ class auditlog_rule(models.Model):
             if field_name in FIELDS_BLACKLIST:
                 continue
             field = self._get_field(log.model_id, field_name)
-            log_vals = self._prepare_log_line_vals_on_write(
-                log, field, old_values, new_values)
-            log_line_model.create(log_vals)
+            # not all fields have an ir.models.field entry (ie. related fields)
+            if field:
+                log_vals = self._prepare_log_line_vals_on_write(
+                    log, field, old_values, new_values)
+                log_line_model.create(log_vals)
 
     def _prepare_log_line_vals_on_write(
             self, log, field, old_values, new_values):
@@ -434,9 +446,11 @@ class auditlog_rule(models.Model):
             if field_name in FIELDS_BLACKLIST:
                 continue
             field = self._get_field(log.model_id, field_name)
-            log_vals = self._prepare_log_line_vals_on_create(
-                log, field, new_values)
-            log_line_model.create(log_vals)
+            # not all fields have an ir.models.field entry (ie. related fields)
+            if field:
+                log_vals = self._prepare_log_line_vals_on_create(
+                    log, field, new_values)
+                log_line_model.create(log_vals)
 
     def _prepare_log_line_vals_on_create(self, log, field, new_values):
         """Prepare the dictionary of values used to create a log line on a
