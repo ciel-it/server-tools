@@ -126,8 +126,11 @@ class Image(models.Model):
     def _get_image_sizes(self):
         for s in self:
             try:
-                vals = tools.image_get_resized_images(
-                    s.with_context(bin_size=False).image_main)
+                image = s.with_context(bin_size=False).image_main
+                vals = dict()
+                vals["image_medium"] = tools.image_resize_image_medium(
+                    image, size=(300, 300))
+                vals["image_small"] = tools.image_resize_image_small(image)
             except:
                 vals = {"image_medium": False,
                         "image_small": False}
